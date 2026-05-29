@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { MenuParserService } from './menu-parser.service';
-import { DocxMenuParser } from './menu-parser-implementations/docx-menu-parser';
+import { DocxMenuParser } from './menu-parser-implementations/docx-menu-parser-new';
 import { MenuFileParser } from './menu-parser.interface';
 
 @Module({
