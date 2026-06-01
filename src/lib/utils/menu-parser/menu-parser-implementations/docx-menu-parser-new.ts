@@ -141,7 +141,7 @@ export class DocxMenuParser extends MenuFileParser {
     return {
       name: null,
       relevantFrom: menuDate.set('h', 8).toDate(),
-      expire: menuDate.set('h', 10).toDate(),
+      expire: menuDate.set({ 'h': 9, 'm': 30 }).toDate(),
       providingCanteenName: '',
       menuPositions: result,
     };
