@@ -22,29 +22,43 @@ export class DocxMenuParser extends MenuFileParser {
 
   parseFile(filePath: string);
   parseFile(buffer: Buffer);
-  async parseFile(buffer: unknown): Promise<menuDeclaration> {
+   async parseFile(buffer: unknown): Promise<menuDeclaration> {
     if (!(buffer instanceof Buffer)) {
-      throw new NotAcceptableException('Ожидался Buffer');
+      throw new NotAcceptableException('Некорректный формат файла меню');
     }
 
-    try {
-      const workbook = XLSX.read(buffer, { type: 'buffer' });
-      if (workbook && workbook.SheetNames.length > 0) {
-        return this.parseExcel(workbook);
-      }
-    } catch (e) {}
+    // Переводим первые несколько килобайт буфера в строку для точного определения формата
+    const bufferString = buffer.toString('utf8', 0, 4000);
 
+    // 1. Если это Excel (.xlsx или .xls)
+    // Современный .xlsx содержит маркер "xl/", а старый .xls — бинарный маркер "Microsoft Excel"
+    if (bufferString.includes('xl/') || bufferString.includes('Microsoft Excel') || buffer.toString('hex', 0, 8).startsWith('d0cf11e0')) {
+      try {
+        const workbook = XLSX.read(buffer, { type: 'buffer' });
+        if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
+          console.log('Start Excel');
+          return this.parseExcel(workbook);
+        }
+      } catch (e) {
+        // Если Excel почему-то не распарсился, выводим ошибку
+        throw new NotAcceptableException('Ошибка чтения Excel-файла');
+      }
+    }
+
+    // 2. Если это оригинальный Word-файл (.docx) — код полностью изолирован
     try {
       const extractor = new WordExtractor();
       const extracted = await extractor.extract(buffer);
       if (!extracted) throw new BadRequestException();
+      console.log('Start Word');
       return this.parseDocument(extracted);
     } catch (err) {
       throw new NotAcceptableException(
-        err.message ?? 'Поддерживаются только .docx, .xlsx, .xls',
+        err.message ?? 'Некорректный формат файла меню',
       );
     }
   }
+
 
   async parseExcel(workbook: XLSX.WorkBook): Promise<menuDeclaration> {
     const sheetName = workbook.SheetNames[0];
@@ -71,7 +85,7 @@ export class DocxMenuParser extends MenuFileParser {
       if (dateFound) break;
     }
 
-    if (!dateFound) throw new BadRequestException('Не найдена строка с датой меню');
+    if (!dateFound) throw new BadRequestException('В Excel-файле не найдена строка с датой меню');
 
     let tableStartRowIndex = -1;
     for (let i = 0; i < rows.length; i++) {
@@ -81,7 +95,7 @@ export class DocxMenuParser extends MenuFileParser {
       }
     }
 
-    if (tableStartRowIndex === -1) throw new BadRequestException('Не найдена колонка "ККАЛ"');
+    if (tableStartRowIndex === -1) throw new BadRequestException('В Excel-файле не найдена колонка "ККАЛ"');
 
     const result: menuPositionDeclaration[] = [];
     let currentCategory = 'Общее';
@@ -90,7 +104,10 @@ export class DocxMenuParser extends MenuFileParser {
       const row = rows[i];
       if (!row || row.length === 0) continue;
 
-      if (row.every(cell => String(cell || '').trim() === '')) break;
+      if (row.every(cell => String(cell || '').trim() === '')) {
+        console.log('Достигнута пустая строка. Парсинг Excel завершен.');
+        break;
+      }
 
       const dietText = String(row[1] || '').trim();
       const nameText = String(row[2] || '').trim();
@@ -105,8 +122,11 @@ export class DocxMenuParser extends MenuFileParser {
 
       if (!nameText && !dietText && !quantityText) continue;
 
-      const rubles = +(priceText.match(/(\d+)\s*р/)?.[1] ?? 0);
-      const kopecks = +(priceText.match(/(\d+)\s*к/)?.[1] ?? 0);
+      const rublesMatch = priceText.match(/(\d+)\s*р/);
+      const kopecksMatch = priceText.match(/(\d+)\s*к/);
+      
+      const rubles = rublesMatch ? +rublesMatch[1] : 0;
+      const kopecks = kopecksMatch ? +kopecksMatch[1] : 0;
       let price = (rubles * 100) + kopecks;
 
       if (price === 0 && !isNaN(+priceText.replace(',', '.'))) {
@@ -114,7 +134,7 @@ export class DocxMenuParser extends MenuFileParser {
       }
 
       if (isNaN(price) || price === 0) {
-        throw new BadRequestException(`Ошибка цены для: "${nameText || dietText}"`);
+        throw new BadRequestException(`Ошибка обработки цены в Excel для блюда: "${nameText || dietText}"`);
       }
 
       const finalName = dietText ? `${nameText} (Диета ${dietText})` : nameText;
@@ -147,14 +167,12 @@ export class DocxMenuParser extends MenuFileParser {
   }
 
   parseDocument(document: WordExtractor.Document) {
-    // 1. Извлекаем и чистим строки
     const documentLines = document
       .getBody()
       .split(/\n|\t/)
       .map(item => item.trim())
       .filter((item) => !!item);
 
-    // 2. Оригинальный поиск даты по жесткому индексу строки
     if (!documentLines[1]) throw new BadRequestException('Строка даты не найдена');
 
     const dateStr = documentLines[1].slice(
@@ -168,7 +186,6 @@ export class DocxMenuParser extends MenuFileParser {
       throw new BadRequestException(`Не удалось распознать дату из строки: "${dateStr}"`);
     }
 
-    // 3. Ищем начало таблицы блюд
     const startIndex = documentLines.findIndex((item) => item.toUpperCase().includes('ККАЛ'));
     if (startIndex === -1) {
       throw new BadRequestException('Некорректный формат файла. Не найдена колонка ККАЛ.');
@@ -177,7 +194,6 @@ export class DocxMenuParser extends MenuFileParser {
     const result: menuPositionDeclaration[] = [];
     let currentCategory: string = undefined;
 
-    // 4. Обход позиций меню
     for (let i = startIndex + 1; i < documentLines.length; i++) {
       const currentStr = documentLines[i];
 
@@ -186,7 +202,6 @@ export class DocxMenuParser extends MenuFileParser {
       let priceIndex = -1;
       let hasDiet = false;
 
-      // Диета — это ВСЕГДА только цифры (например, "5" или "7,8")
       const isPotentialDiet = /^[0-9,\s]+$/.test(currentStr);
 
       if (isPotentialDiet && documentLines[i + 3] && (documentLines[i + 3].includes('р.') || documentLines[i + 3].includes('к.'))) {
@@ -198,13 +213,11 @@ export class DocxMenuParser extends MenuFileParser {
         hasDiet = false;
       }
 
-      // Если структура не распознана как блюдо с диетой или без — это категория
       if (priceIndex === -1) {
         currentCategory = currentStr;
         continue;
       }
 
-      // Разбираем структуру блока
       const diet = hasDiet ? currentStr : null;
       const name = hasDiet ? documentLines[i + 1] : currentStr;
       const quantity = documentLines[priceIndex - 1];
@@ -216,7 +229,6 @@ export class DocxMenuParser extends MenuFileParser {
         ? descriptionLine.replace(/\//g, '').trim()
         : '';
 
-      // Парсим цену
       const rubles = +(priceStr.match(/(\d+)р/)?.[1] ?? 0);
       const kopecks = +(priceStr.match(/(\d+)к/)?.[1] ?? 0);
       const price = (rubles * 100) + kopecks;

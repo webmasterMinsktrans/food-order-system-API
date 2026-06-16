@@ -6,10 +6,11 @@ import * as path from 'path';
 export class MenuParserService {
   constructor(@Inject('PARSERS') private readonly parsers: MenuFileParser[]) {}
 
-  async parseMenuFile(file: Express.Multer.File) {
-    const extName = path.extname(file.originalname);
+   async parseMenuFile(file: Express.Multer.File) {
+    const extName = path.extname(file.originalname).toLowerCase(); 
+    
     for (const parser of this.parsers) {
-      if (parser.getParsedExtensions().toLowerCase() === extName) {
+      if (parser.getParsedExtensions().toLowerCase().includes(extName)) {
         return parser.parseFile(file.buffer);
       }
     }
