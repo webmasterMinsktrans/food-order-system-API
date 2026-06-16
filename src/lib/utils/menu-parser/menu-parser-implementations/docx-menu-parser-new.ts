@@ -93,9 +93,15 @@ export class DocxMenuParser extends MenuFileParser {
     if (!dateFound) throw new BadRequestException('В Excel-файле не найдена строка с датой меню');
 
     let tableStartRowIndex = -1;
+    let baseOffset = 0; // Базовый сдвиг по умолчанию
+
     for (let i = 0; i < rows.length; i++) {
-      if (rows[i].some(cell => String(cell || '').toUpperCase().includes('ККАЛ'))) {
+      const hasKcal = rows[i].some(cell => String(cell || '').toUpperCase().includes('ККАЛ'));
+      if (hasKcal) {
         tableStartRowIndex = i;
+        // ОПРЕДЕЛЯЕМ СДВИГ ОДИН РАЗ ПО ШАПКЕ ТАБЛИЦЫ
+        // Если самый первый элемент в строке с ККАЛ пустой — во всем файле идет пустой столбец А
+        baseOffset = String(rows[i][0] || '').trim() === '' ? 0 : -1;
         break;
       }
     }
@@ -114,12 +120,12 @@ export class DocxMenuParser extends MenuFileParser {
         break;
       }
 
-      // Базовые значения по ТЗ (когда диета присутствует)
-      let dietText = String(row[1] || '').trim();     
-      let nameText = String(row[2] || '').trim();     
-      let quantityText = String(row[9] || '').trim(); 
-      let priceText = String(row[11] || '').trim();   
-      let kcalText = String(row[14] || '').trim();    
+      // Используем стабильный baseOffset, вычисленный по шапке
+      let dietText = String(row[1 + baseOffset] || '').trim();     
+      let nameText = String(row[2 + baseOffset] || '').trim();     
+      let quantityText = String(row[9 + baseOffset] || '').trim(); 
+      let priceText = String(row[11 + baseOffset] || '').trim();   
+      let kcalText = String(row[14 + baseOffset] || '').trim();    
 
       // Проверка на строку состава блюда (слэши)
       if (dietText.startsWith('/') || nameText.startsWith('/')) {
@@ -132,13 +138,16 @@ export class DocxMenuParser extends MenuFileParser {
         continue; 
       }
 
-      // КОРРЕКЦИЯ СДВИГА: Если диеты нет, вся строка съезжает влево на 1 ячейку
-      if (!nameText && dietText && !dietText.startsWith('/') && String(row[10] || '').trim() !== '') {
-        nameText = String(row[1] || '').trim();
-        dietText = ''; // Диеты нет
-        quantityText = String(row[8] || '').trim();
-        priceText = String(row[10] || '').trim();
-        kcalText = String(row[13] || '').trim();
+      // КОРРЕКЦИЯ СДВИГА ДЛЯ БЛЮД БЕЗ ДИЕТЫ
+      const checkKcalIndex = 13 + baseOffset;
+      // Добавлено строгое ограничение: длина текста «диеты» не должна превышать 10 символов.
+      // Это гарантирует, что длинное название категории никогда не сочтут за номер диеты.
+      if (!nameText && dietText && dietText.length < 10 && !dietText.startsWith('/') && String(row[checkKcalIndex] || '').trim() !== '') {
+        nameText = String(row[1 + baseOffset] || '').trim();
+        dietText = ''; 
+        quantityText = String(row[8 + baseOffset] || '').trim();
+        priceText = String(row[10 + baseOffset] || '').trim();
+        kcalText = String(row[13 + baseOffset] || '').trim();
       }
 
       // Проверка на строку новой категории
@@ -147,12 +156,17 @@ export class DocxMenuParser extends MenuFileParser {
         continue;
       }
 
+      // Дополнительная проверка на категорию, если таблица прижата влево (baseOffset = -1)
+      if (baseOffset === -1 && dietText && !quantityText && !priceText && !dietText.startsWith('/')) {
+        currentCategory = dietText;
+        continue;
+      }
+
       if (!nameText && !dietText && !quantityText) continue;
 
       let price = 0;
       let usedPriceStr = priceText;
 
-      // Если в целевой ячейке всё еще пусто, ищем цену по всей строке динамически
       if (!usedPriceStr.trim()) {
         const foundCell = row.find(cell => {
           const c = String(cell || '').trim().toLowerCase();
@@ -167,7 +181,6 @@ export class DocxMenuParser extends MenuFileParser {
       const rublesMatch = cleanPriceStr.match(/(\d+)\s*р/);
       const kopecksMatch = cleanPriceStr.match(/(\d+)\s*к/);
 
-      // ИСПРАВЛЕНО: Добавлены индексы [1] для корректного извлечения чисел из регулярного выражения
       if (rublesMatch || kopecksMatch) {
         const rubles = rublesMatch ? +rublesMatch[1] : 0;
         const kopecks = kopecksMatch ? +kopecksMatch[1] : 0;
