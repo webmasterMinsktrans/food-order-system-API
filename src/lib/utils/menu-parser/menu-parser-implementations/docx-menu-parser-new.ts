@@ -147,12 +147,14 @@ export class DocxMenuParser extends MenuFileParser {
   }
 
   parseDocument(document: WordExtractor.Document) {
+    // 1. Извлекаем и чистим строки
     const documentLines = document
       .getBody()
       .split(/\n|\t/)
       .map(item => item.trim())
       .filter((item) => !!item);
 
+    // 2. Оригинальный поиск даты по жесткому индексу строки
     if (!documentLines[1]) throw new BadRequestException('Строка даты не найдена');
 
     const dateStr = documentLines[1].slice(
@@ -161,39 +163,48 @@ export class DocxMenuParser extends MenuFileParser {
     ).trim();
 
     const menuDate = dayjs(dateStr, 'D MMMM YYYY', 'ru').tz('Europe/Minsk');
-    if (!menuDate.isValid()) throw new BadRequestException(`Не распознана дата: "${dateStr}"`);
 
+    if (!menuDate.isValid()) {
+      throw new BadRequestException(`Не удалось распознать дату из строки: "${dateStr}"`);
+    }
+
+    // 3. Ищем начало таблицы блюд
     const startIndex = documentLines.findIndex((item) => item.toUpperCase().includes('ККАЛ'));
-    if (startIndex === -1) throw new BadRequestException('Не найдена колонка ККАЛ.');
+    if (startIndex === -1) {
+      throw new BadRequestException('Некорректный формат файла. Не найдена колонка ККАЛ.');
+    }
 
     const result: menuPositionDeclaration[] = [];
-    let currentCategory: string = 'Общее';
+    let currentCategory: string = undefined;
 
+    // 4. Обход позиций меню
     for (let i = startIndex + 1; i < documentLines.length; i++) {
       const currentStr = documentLines[i];
-      if (currentStr.startsWith('/')) continue;
 
-      if (currentStr.toLowerCase().includes('составил') || 
-          currentStr.toLowerCase().includes('директор') || 
-          currentStr.toLowerCase().includes('заведующий')) break; 
+      if (currentStr.startsWith('/')) continue;
 
       let priceIndex = -1;
       let hasDiet = false;
+
+      // Диета — это ВСЕГДА только цифры (например, "5" или "7,8")
       const isPotentialDiet = /^[0-9,\s]+$/.test(currentStr);
 
       if (isPotentialDiet && documentLines[i + 3] && (documentLines[i + 3].includes('р.') || documentLines[i + 3].includes('к.'))) {
         priceIndex = i + 3;
         hasDiet = true;
-      } else if (documentLines[i + 2] && (documentLines[i + 2].includes('р.') || documentLines[i + 2].includes('к.'))) {
+      }
+      else if (documentLines[i + 2] && (documentLines[i + 2].includes('р.') || documentLines[i + 2].includes('к.'))) {
         priceIndex = i + 2;
         hasDiet = false;
       }
 
+      // Если структура не распознана как блюдо с диетой или без — это категория
       if (priceIndex === -1) {
         currentCategory = currentStr;
         continue;
       }
 
+      // Разбираем структуру блока
       const diet = hasDiet ? currentStr : null;
       const name = hasDiet ? documentLines[i + 1] : currentStr;
       const quantity = documentLines[priceIndex - 1];
@@ -205,11 +216,14 @@ export class DocxMenuParser extends MenuFileParser {
         ? descriptionLine.replace(/\//g, '').trim()
         : '';
 
+      // Парсим цену
       const rubles = +(priceStr.match(/(\d+)р/)?.[1] ?? 0);
       const kopecks = +(priceStr.match(/(\d+)к/)?.[1] ?? 0);
       const price = (rubles * 100) + kopecks;
 
-      if (isNaN(price) || price === 0) throw new BadRequestException(`Ошибка цены блюда ${name}`);
+      if (isNaN(price) || price === 0) {
+        throw new BadRequestException(`Ошибка обработки цены блюда ${name}`);
+      }
 
       const finalName = diet ? `${name} (Диета ${diet})` : name;
 
@@ -217,16 +231,16 @@ export class DocxMenuParser extends MenuFileParser {
         price,
         discount: 0,
         dishDescription: {
-          name: finalName.slice(0, 150),
-          description: description ? description.slice(0, 255) : '',
-          quantity: quantity.slice(0, 45),
-          calorieContent: kcalStr ? kcalStr.trim().slice(0, 45) : null,
+          name: finalName,
+          description,
+          quantity,
+          calorieContent: kcalStr ? kcalStr.trim() : null,
           bestBeforeDate: null,
           carbohydrates: null,
           externalProducer: null,
           proteins: null,
           fats: null,
-          categoryName: currentCategory.slice(0, 100),
+          categoryName: currentCategory,
         },
       });
 
