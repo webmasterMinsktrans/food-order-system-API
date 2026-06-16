@@ -22,35 +22,36 @@ export class DocxMenuParser extends MenuFileParser {
 
   parseFile(filePath: string);
   parseFile(buffer: Buffer);
-   async parseFile(buffer: unknown): Promise<menuDeclaration> {
+  async parseFile(buffer: unknown): Promise<menuDeclaration> {
     if (!(buffer instanceof Buffer)) {
       throw new NotAcceptableException('Некорректный формат файла меню');
     }
 
-    // Переводим первые несколько килобайт буфера в строку для точного определения формата
-    const bufferString = buffer.toString('utf8', 0, 4000);
-
-    // 1. Если это Excel (.xlsx или .xls)
-    // Современный .xlsx содержит маркер "xl/", а старый .xls — бинарный маркер "Microsoft Excel"
-    if (bufferString.includes('xl/') || bufferString.includes('Microsoft Excel') || buffer.toString('hex', 0, 8).startsWith('d0cf11e0')) {
-      try {
-        const workbook = XLSX.read(buffer, { type: 'buffer' });
-        if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
+    // 1. Пытаемся обработать файл как Excel (.xls / .xlsx)
+    try {
+      // cellNF и cellText заставляют библиотеку считывать маски форматов отображения
+      const workbook = XLSX.read(buffer, { 
+        type: 'buffer',
+        cellNF: true,
+        cellText: true
+      });
+      if (workbook && workbook.SheetNames && workbook.SheetNames.length > 0) {
+        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+        if (firstSheet && firstSheet['!ref']) {
           console.log('Start Excel');
           return this.parseExcel(workbook);
         }
-      } catch (e) {
-        // Если Excel почему-то не распарсился, выводим ошибку
-        throw new NotAcceptableException('Ошибка чтения Excel-файла');
       }
+    } catch (e) {
+      // Игнорируем ошибки парсинга Excel и идем к Word
     }
 
-    // 2. Если это оригинальный Word-файл (.docx) — код полностью изолирован
+    // 2. Если не Excel, обрабатываем как оригинальный Word-файл
+    const extractor = new WordExtractor();
+    const extracted = await extractor.extract(buffer);
+    if (!extracted) throw new BadRequestException();
     try {
-      const extractor = new WordExtractor();
-      const extracted = await extractor.extract(buffer);
-      if (!extracted) throw new BadRequestException();
-      console.log('Start Word');
+      console.log('Start');
       return this.parseDocument(extracted);
     } catch (err) {
       throw new NotAcceptableException(
@@ -59,11 +60,15 @@ export class DocxMenuParser extends MenuFileParser {
     }
   }
 
-
   async parseExcel(workbook: XLSX.WorkBook): Promise<menuDeclaration> {
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json<string[]>(worksheet, { header: 1, defval: '' });
+    
+    const rows = XLSX.utils.sheet_to_json<string[]>(worksheet, { 
+      header: 1, 
+      defval: '',
+      raw: false 
+    });
 
     let menuDate = dayjs().tz('Europe/Minsk');
     let dateFound = false;
@@ -109,12 +114,34 @@ export class DocxMenuParser extends MenuFileParser {
         break;
       }
 
-      const dietText = String(row[1] || '').trim();
-      const nameText = String(row[2] || '').trim();
-      const quantityText = String(row[9] || '').trim();
-      const priceText = String(row[11] || '').trim();
-      const kcalText = String(row[14] || '').trim();
+      // Базовые значения по ТЗ (когда диета присутствует)
+      let dietText = String(row[1] || '').trim();     
+      let nameText = String(row[2] || '').trim();     
+      let quantityText = String(row[9] || '').trim(); 
+      let priceText = String(row[11] || '').trim();   
+      let kcalText = String(row[14] || '').trim();    
 
+      // Проверка на строку состава блюда (слэши)
+      if (dietText.startsWith('/') || nameText.startsWith('/')) {
+        const rawComposition = dietText.startsWith('/') ? dietText : nameText;
+        const cleanDescription = rawComposition.replace(/\//g, '').trim();
+        
+        if (result.length > 0) {
+          result[result.length - 1].dishDescription.description = cleanDescription.slice(0, 255);
+        }
+        continue; 
+      }
+
+      // КОРРЕКЦИЯ СДВИГА: Если диеты нет, вся строка съезжает влево на 1 ячейку
+      if (!nameText && dietText && !dietText.startsWith('/') && String(row[10] || '').trim() !== '') {
+        nameText = String(row[1] || '').trim();
+        dietText = ''; // Диеты нет
+        quantityText = String(row[8] || '').trim();
+        priceText = String(row[10] || '').trim();
+        kcalText = String(row[13] || '').trim();
+      }
+
+      // Проверка на строку новой категории
       if (nameText && !quantityText && !priceText) {
         currentCategory = nameText;
         continue;
@@ -122,19 +149,41 @@ export class DocxMenuParser extends MenuFileParser {
 
       if (!nameText && !dietText && !quantityText) continue;
 
-      const rublesMatch = priceText.match(/(\d+)\s*р/);
-      const kopecksMatch = priceText.match(/(\d+)\s*к/);
-      
-      const rubles = rublesMatch ? +rublesMatch[1] : 0;
-      const kopecks = kopecksMatch ? +kopecksMatch[1] : 0;
-      let price = (rubles * 100) + kopecks;
+      let price = 0;
+      let usedPriceStr = priceText;
 
-      if (price === 0 && !isNaN(+priceText.replace(',', '.'))) {
-        price = Math.round(+priceText.replace(',', '.') * 100);
+      // Если в целевой ячейке всё еще пусто, ищем цену по всей строке динамически
+      if (!usedPriceStr.trim()) {
+        const foundCell = row.find(cell => {
+          const c = String(cell || '').trim().toLowerCase();
+          return (c.includes('р') && /\d/.test(c)) || (!isNaN(+c.replace(',', '.')) && +c > 0);
+        });
+        if (foundCell) {
+          usedPriceStr = String(foundCell).trim();
+        }
+      }
+
+      const cleanPriceStr = usedPriceStr.replace(/\s+/g, '').toLowerCase();
+      const rublesMatch = cleanPriceStr.match(/(\d+)\s*р/);
+      const kopecksMatch = cleanPriceStr.match(/(\d+)\s*к/);
+
+      // ИСПРАВЛЕНО: Добавлены индексы [1] для корректного извлечения чисел из регулярного выражения
+      if (rublesMatch || kopecksMatch) {
+        const rubles = rublesMatch ? +rublesMatch[1] : 0;
+        const kopecks = kopecksMatch ? +kopecksMatch[1] : 0;
+        price = (rubles * 100) + kopecks;
+      } else {
+        const normalizedPrice = cleanPriceStr.replace(',', '.').replace('-', '.');
+        if (!isNaN(+normalizedPrice) && +normalizedPrice > 0) {
+          price = Math.round(+normalizedPrice * 100);
+        }
       }
 
       if (isNaN(price) || price === 0) {
-        throw new BadRequestException(`Ошибка обработки цены в Excel для блюда: "${nameText || dietText}"`);
+        const rowJson = JSON.stringify(row);
+        throw new BadRequestException(
+          `Ошибка обработки цены для: "${nameText || dietText}". Вся строка: ${rowJson}`
+        );
       }
 
       const finalName = dietText ? `${nameText} (Диета ${dietText})` : nameText;
