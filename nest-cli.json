@@ -5,7 +5,7 @@
   "compilerOptions": {
     "deleteOutDir": true,
     "assets": [
-      { "include": "assets/templates/**/*.html", "outDir": "dist/src/assets", "watchAssets": true }
+      { "include": "assets/templates/**/*.html", "watchAssets": true }
     ],
     "watchAssets": true
   }
