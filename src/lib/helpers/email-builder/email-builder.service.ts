@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { promises as fs } from 'fs';
-import { templatesPath } from '../../../../share'; 
+import { templatesPath } from '../../../share'; 
 
 @Injectable()
 export class EmailBuilderService {
